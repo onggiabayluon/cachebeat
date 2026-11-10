@@ -17,6 +17,7 @@ export type Saved = {
   warmModel: string | null // the model the last request ran on, whose cache a beat keeps warm
   tail: string | null // how the conversation ended after the last turn: another ending means /rewind took it back
   asked: number | null // when the user last sent a message (a turn's start): Stop after idle counts from it
+  missStreak: number // beats in a row that were not served from the cache: beating stops at two
   turns: number // turns this conversation has had: after its first, Claude Code can cache it anew out of a beat's reach
 }
 

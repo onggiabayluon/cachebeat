@@ -250,9 +250,11 @@ cachebeat turns itself off for the session when:
 - you haven't sent a message for longer than **Stop after idle**
 - a usage limit reaches **Stop at usage**
 - the API rate-limits it, or returns an error that doesn't clear up (a passing hiccup is retried a minute later)
-- the cache is already gone, so there's nothing left to keep warm
+- two beats in a row are not served from the cache (one miss, say a proxy switching accounts, counts as a beat that re-warmed it, and a beat that reads the cache starts the count again)
 
 It tells you why, the way you chose under **Alerts**. On auto, a cache that's gone before a 50-minute beat lasts five minutes: instead of stopping, cachebeat says so and beats every 4 minutes from there.
+
+A stop is also written to the plugin store (`~/.claude/plugins/store/cachebeat_*.json`, key `stops`) as `{ "<folder>": { "at": <epoch ms>, "why": "..." } }`, so a status display outside Claude Code can tell. Turning beating on again removes the entry. The key is the session's folder, since a plugin can't see its session id, so two sessions in one folder share it.
 
 ## Good to know
 

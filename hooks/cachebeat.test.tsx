@@ -427,14 +427,46 @@ test('a beat can toast', async ($: Engine, on: On) => {
   expect(toasts).toEqual(['♥ cache kept warm · 90k read'])
 })
 
-test('at a fixed interval, stops when the fork was not served from cache', async ($: Engine, on: On) => {
-  const { clock, forks, logs } = await setup($, on, { fork: [{ ...ok, usage: usage(0, 90_000) }], settings: { interval: 50 } })
+test('at a fixed interval, one beat missing the cache re-warms it and beating goes on', async ($: Engine, on: On) => {
+  const { clock, forks, logs } = await setup($, on, { fork: [{ ...ok, usage: usage(0, 90_000) }, ok], settings: { interval: 50 } })
   await cmd($, 'on')
   await $.turn.complete(turn)
   await clock.advance(IDLE * 3)
-  expect(forks.length).toBe(1)
+  expect(forks.length).toBeGreaterThan(1)
+  expect(logs.some(l => l.includes('stopped'))).toBe(false)
+  expect(String(await cmd($, ''))).toMatch(/^on, /)
+})
+
+test('at a fixed interval, stops when two beats in a row were not served from cache', async ($: Engine, on: On) => {
+  const { clock, forks, logs, store } = await setup($, on, { fork: [{ ...ok, usage: usage(0, 90_000) }], settings: { interval: 50 } })
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  await clock.advance(IDLE * 3)
+  expect(forks.length).toBe(2)
   expect(logs.at(-1)).toContain('stopped: the cache was not served')
   expect(await cmd($, '')).toBe('off')
+  // the stop is told to whoever watches this folder from outside
+  expect(store.get('stops')).toEqual({ [HOME]: { at: expect.any(Number), why: expect.stringContaining('the cache was not served') } })
+})
+
+test('a beat that reads the cache resets the count of misses', async ($: Engine, on: On) => {
+  const miss = { ...ok, usage: usage(0, 90_000) }
+  const { clock, forks, logs } = await setup($, on, { fork: [miss, ok, miss, ok, miss, ok], settings: { interval: 50 } })
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  await clock.advance(IDLE * 6)
+  expect(forks.length).toBeGreaterThanOrEqual(5)
+  expect(logs.some(l => l.includes('stopped'))).toBe(false)
+})
+
+test('turning beating on again clears the stop told outside', async ($: Engine, on: On) => {
+  const { clock, store } = await setup($, on, { fork: [{ ...ok, usage: usage(0, 90_000) }], settings: { interval: 50 } })
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  await clock.advance(IDLE * 3)
+  expect(store.get('stops')).toBeDefined()
+  await cmd($, 'on')
+  expect(store.get('stops')).toEqual({})
 })
 
 test('stops at the deadline after the last real turn', async ($: Engine, on: On) => {
@@ -884,7 +916,7 @@ test('auto beats at 4m on a five-minute cache', async ($: Engine, on: On) => {
   expect(forks).toEqual([4 * M, 8 * M])
 })
 
-test('under auto, a cache gone before the hour beats every 4m from there, and stops if that misses too', async ($: Engine, on: On) => {
+test('under auto, a cache gone before the hour beats every 4m from there, and stops if two more miss in a row', async ($: Engine, on: On) => {
   const miss = { ...ok, usage: usage(0, 90_000) }
   const { clock, forks, logs } = await setup($, on, { fork: [miss, ok, miss] })
   await cmd($, 'on')
@@ -893,8 +925,8 @@ test('under auto, a cache gone before the hour beats every 4m from there, and st
   expect(logs.at(-1)).toBe("the cache was not served (0 read, 90,000 written): this session's cache lasts 5 minutes, so beats come every 4m")
   expect(await cmd($, '')).toBe('on, every 4m idle · 0 beats · next beat in 4m')
   expect((await stateNow($)).session.cacheTtl).toBe('5m')
-  await clock.advance(8 * M)
-  expect(forks).toEqual([IDLE, IDLE + 4 * M, IDLE + 8 * M])
+  await clock.advance(12 * M)
+  expect(forks).toEqual([IDLE, IDLE + 4 * M, IDLE + 8 * M, IDLE + 12 * M])
   expect(logs.at(-1)).toContain('stopped: the cache was not served')
 })
 

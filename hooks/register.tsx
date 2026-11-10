@@ -27,7 +27,7 @@ const focusAtom = atom({ plugin: 'cachebeat', key: 'focus' } as const, '')
 
 const fresh: Saved = {
   enabled: false, idle: null, lastReal: null, lastWarm: null, lastRead: null, lastWrote: null, nextAt: null, beats: 0, row: null, small: null,
-  isCacheShort: false, paused: null, warmModel: null, tail: null, asked: null, turns: 0,
+  isCacheShort: false, paused: null, warmModel: null, tail: null, asked: null, turns: 0, missStreak: 0,
 }
 let s: Saved = { ...fresh }
 let cfg: BeatSettings = DEFAULTS // as they apply here: this folder's own over those for all folders
@@ -433,13 +433,31 @@ async function resumeIfWarmed($: EngineInterface) {
   await schedule($)
 }
 
+/**
+ * Tells whoever watches from outside (a status pill, a script) that beating stopped on its own, and why: the
+ * plugin store's `stops`, by folder. Turning beating on again, here or by the session's own choice, takes it out.
+ */
+async function noteStop($: EngineInterface, why: string | null) {
+  const stored = await $.store.get('stops')
+  const stops = isObject(stored) ? { ...stored } : {}
+  if (why === null) {
+    if (!(root in stops)) return
+    delete stops[root]
+  } else stops[root] = { at: await $.clock.now(), why }
+  await $.store.set('stops', stops)
+}
+
 function stop($: EngineInterface, why?: string) {
   s.enabled = false
   void schedule($)
   if (!why) return 'off'
+  void noteStop($, why)
   announce($, `stopped: ${why}`)
   return `stopped: ${why}`
 }
+
+/** Beats in a row that miss the cache before beating stops: one can be a proxy switching accounts. */
+const MISSES = 2
 
 const ASK = '[cachebeat] Automated prompt cache keep-alive, not a message from the user. Do not continue any task or use any tool. Reply with a single period and nothing else.'
 // mid-turn, the request a beat re-sends ends with the user's message, the tool call made for it left out: told
@@ -527,15 +545,24 @@ async function beat($: EngineInterface): Promise<string> {
   // read: no sign the cache lapsed
   if (got < wrote && wasIdle) {
     const why = `the cache was not served (${got.toLocaleString()} read, ${wrote.toLocaleString()} written)`
+    s.missStreak++
+    // one miss can be a proxy switching accounts, not a cache that can't be kept: this beat wrote the cache afresh,
+    // so it counts as a warm one. Two in a row, and beating stops
+    if (s.missStreak >= MISSES) return stop($, why)
+    s.lastWarm = await $.clock.now()
     // under auto, a cache gone before an hour's interval lives five minutes, whatever the signs said:
     // this beat wrote it afresh, so beat at that from here
-    if (cfg.interval !== 'auto' || s.idle !== null || s.isCacheShort || ttl === '5m') return stop($, why)
-    s.isCacheShort = true
-    s.lastWarm = await $.clock.now()
-    announce($, `${why}: this session's cache lasts 5 minutes, so beats come every ${AUTO['5m']}m`)
+    if (cfg.interval === 'auto' && s.idle === null && !s.isCacheShort && ttl !== '5m') {
+      s.isCacheShort = true
+      announce($, `${why}: this session's cache lasts 5 minutes, so beats come every ${AUTO['5m']}m`)
+      await schedule($)
+      return `${why}; beating every ${AUTO['5m']}m`
+    }
+    $.ui.log(`${why}: counted as a beat, stops if the next one misses too`)
     await schedule($)
-    return `${why}; beating every ${AUTO['5m']}m`
+    return `${why}; one miss, beating goes on`
   }
+  s.missStreak = 0
   s.lastWarm = await $.clock.now()
   // what the conversation's cache holds: a fork that tried a tool asks twice, and its usage counts both reads
   s.lastRead = cached > 0 ? Math.min(got, cached) : got
@@ -599,6 +626,7 @@ async function turnOn($: EngineInterface, change?: () => Promise<void>) {
   const before = idle()
   if (change) await change()
   s.enabled = true
+  await noteStop($, null)
   if (stepping) {
     save($)
     return `on, ${every()}; ${when(undefined)}`
@@ -860,6 +888,7 @@ export const register: Register = on => {
     }
     if (change.intervalMinutes !== undefined) s.idle = change.intervalMinutes === null ? null : change.intervalMinutes * MIN
     if (change.enabled !== undefined) s.enabled = change.enabled
+    if (change.enabled) await noteStop($, null)
     // always: setSettings reschedules only while on, and this is what cancels a beat when turned off
     await schedule($)
     return { result: json(await answerSet($, before, change)) }
