@@ -625,6 +625,7 @@ async function turnOn($: EngineInterface, change?: () => Promise<void>) {
   const wasOn = s.enabled
   const before = idle()
   if (change) await change()
+  if (!wasOn) s.missStreak = 0
   s.enabled = true
   await noteStop($, null)
   if (stepping) {
@@ -887,6 +888,7 @@ export const register: Register = on => {
       })
     }
     if (change.intervalMinutes !== undefined) s.idle = change.intervalMinutes === null ? null : change.intervalMinutes * MIN
+    if (change.enabled && !s.enabled) s.missStreak = 0
     if (change.enabled !== undefined) s.enabled = change.enabled
     if (change.enabled) await noteStop($, null)
     // always: setSettings reschedules only while on, and this is what cancels a beat when turned off

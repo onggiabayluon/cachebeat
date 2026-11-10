@@ -469,6 +469,22 @@ test('turning beating on again clears the stop told outside', async ($: Engine, 
   expect(store.get('stops')).toEqual({})
 })
 
+for (const [how, enable] of [['/cachebeat on', ($: Engine) => cmd($, 'on')], ['the set tool', ($: Engine) => call($, 'set', { session: { enabled: true } })]] as const) {
+  test(`enabling again with ${how} starts the count of misses afresh`, async ($: Engine, on: On) => {
+    const miss = { ...ok, usage: usage(0, 90_000) }
+    const { clock, logs } = await setup($, on, { fork: [miss, miss, miss, ok], settings: { interval: 50 } })
+    await cmd($, 'on')
+    await $.turn.complete(turn)
+    await clock.advance(IDLE * 3)
+    expect(await cmd($, '')).toBe('off')
+    await enable($)
+    await $.turn.complete(turn)
+    await clock.advance(IDLE * 2)
+    expect(logs.filter(l => l.includes('stopped')).length).toBe(1)
+    expect(String(await cmd($, ''))).toMatch(/^on, /)
+  })
+}
+
 test('stops at the deadline after the last real turn', async ($: Engine, on: On) => {
   const { clock, forks, logs } = await setup($, on)
   await cmd($, 'on')
