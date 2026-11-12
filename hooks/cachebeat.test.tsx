@@ -2033,7 +2033,7 @@ for (const defaultOn of [true, false]) {
     if (!hasId($)) return
     expect(liveKeys()).toEqual(['live.S1'])
     expect(live('S1')).toEqual({
-      v: 1, enabled: defaultOn, stopped: null, intervalMin: 7, stopAfterHours: 4, since: expect.any(Number), updatedAt: expect.any(Number),
+      v: 1, enabled: defaultOn, paused: false, stopped: null, intervalMin: 7, stopAfterHours: 4, since: expect.any(Number), updatedAt: expect.any(Number),
     })
   })
 }
@@ -2052,6 +2052,18 @@ test('a resumed new process overwrites the opposite state a record of its sessio
   if (!hasId($)) return
   expect(live('S1')).toMatchObject({ enabled: false, stopped: null, intervalMin: 50, stopAfterHours: 8 })
   expect(live('S1')?.updatedAt).not.toBe(1)
+})
+
+test('a session whose beats wait for its next turn publishes paused, and clears it once they go on', async ($: Engine, on: On) => {
+  const { live, clock } = await setup($, on, {})
+  if (!hasId($)) return
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  await clock.settle()
+  expect(live('S1')).toMatchObject({ enabled: true, paused: false })
+  await $.classic.PostModelSwitch(SWITCH)
+  await clock.settle()
+  expect(live('S1')).toMatchObject({ enabled: true, paused: true })
 })
 
 for (const stop of SELF_STOPS) {

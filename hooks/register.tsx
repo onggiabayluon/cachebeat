@@ -105,12 +105,12 @@ const LIVE_EXIT_MARGIN = 250 // ms of that budget left for the rest of the end
 /** How long an exit waits for the queue: at most a second, and never the budget's last margin. */
 export const exitWait = (remainingMs: number) => Math.min(LIVE_EXIT_WAIT, Math.max(0, remainingMs - LIVE_EXIT_MARGIN))
 
-type Live = { enabled: boolean; stopped: Saved['stopped']; intervalMin: number; stopAfterHours: number; since: number }
+type Live = { enabled: boolean; paused?: boolean; stopped: Saved['stopped']; intervalMin: number; stopAfterHours: number; since: number }
 
 const liveKey = (id: string) => LIVE + id
 const liveSame = (a: Live, b: Live) =>
-  JSON.stringify([a.enabled, a.stopped && [a.stopped.at, a.stopped.why], a.intervalMin, a.stopAfterHours, a.since])
-  === JSON.stringify([b.enabled, b.stopped && [b.stopped.at, b.stopped.why], b.intervalMin, b.stopAfterHours, b.since])
+  JSON.stringify([a.enabled, !!a.paused, a.stopped && [a.stopped.at, a.stopped.why], a.intervalMin, a.stopAfterHours, a.since])
+  === JSON.stringify([b.enabled, !!b.paused, b.stopped && [b.stopped.at, b.stopped.why], b.intervalMin, b.stopAfterHours, b.since])
 
 /** The record as the store holds it, or null when it is missing or not one of ours. */
 function liveFrom(value: unknown): Live | null {
@@ -118,6 +118,7 @@ function liveFrom(value: unknown): Live | null {
   const stopped = value.stopped
   const isStopped = isObject(stopped) && typeof stopped.at === 'number' && typeof stopped.why === 'string'
   if (typeof value.enabled !== 'boolean' || (stopped !== null && !isStopped)) return null
+  if (value.paused !== undefined && typeof value.paused !== 'boolean') return null // 0.9.5 wrote none: not paused
   if (typeof value.intervalMin !== 'number' || typeof value.stopAfterHours !== 'number' || typeof value.since !== 'number') return null
   return value as unknown as Live
 }
@@ -169,7 +170,7 @@ function syncLive($: EngineInterface, opts: { verify?: boolean; id?: string } = 
     // an id left: a publication asked before it left is stale, and an ordinary one may only be the engine still reporting it
     if (left !== undefined && (epoch < left || !opts.id)) return
     const snap: Live = {
-      enabled: s.enabled, stopped: s.stopped, intervalMin: idle() / MIN, stopAfterHours: cfg.stopAfterHours, since: s.since ?? 0,
+      enabled: s.enabled, paused: s.paused !== null, stopped: s.stopped, intervalMin: idle() / MIN, stopAfterHours: cfg.stopAfterHours, since: s.since ?? 0,
     }
     const verify = opts.verify || dirty || pendingSync
     const stored = verify ? liveFrom(await $.store.get(liveKey(id))) : null
