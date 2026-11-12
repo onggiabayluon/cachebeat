@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { VARIANTS, cells, loopIndex, previewFrame, slotText, slotWidths, variant } from './animations'
 import { PANE, cut } from './pane'
-import { DEADLINE, IDLE, RETRY, fmt } from './register'
+import { DEADLINE, IDLE, RETRY, exitWait, fmt, saved } from './register'
 import { DEFAULTS, EPISODE, accept, glyphs, lookOf, mixedMode, normalize, parseFrameMs, parseHours, parseMinutes, parsePercent, parseTokens, spans } from './settings'
 import { SET, STATE } from './tools'
 
@@ -29,14 +29,68 @@ type World = {
   folders?: Record<string, unknown> // the store's folders, by path
   chat?: ReturnType<typeof said>[] // the conversation as the session starts: one there means a resumed session
   during?: (n: number) => Promise<void> // runs while beat n (from 1) is on its way: turn events can arrive meanwhile
+  sessionId?: string | 'missing' | 'rejects' // what `$.session.id()` answers; 'missing' none, 'rejects' an error (default 'S1')
+  seed?: Record<string, unknown> // store keys set before the session starts
 }
 
 const setup = async ($: Engine, on: On, world: World = {}) => {
   const clock = mock.clock(on)
   const store = new Map<string, unknown>(world.settings ? [['settings', { ...DEFAULTS, ...world.settings }]] : [])
   if (world.folders) store.set('folders', world.folders)
+  for (const [k, v] of Object.entries(world.seed ?? {})) store.set(k, v)
+  let sid = world.sessionId ?? 'S1'
+  let idHold: { gate: Promise<void>; arrived: () => void } | null = null
+  const writes: string[] = [] // `set <key>` and `delete <key>`, as the store applied them
+  const holds: { prefix: string; gate: Promise<void>; arrived: () => void }[] = []
+  const failures: { prefix: string; left: number }[] = []
+  // a store call on a held prefix waits at the gate until it is released
+  const held = async (key: string) => {
+    for (const h of holds.filter(x => key.startsWith(x.prefix))) {
+      h.arrived()
+      await h.gate
+    }
+  }
+  const mayFail = (key: string) => {
+    const f = failures.find(x => key.startsWith(x.prefix) && x.left > 0)
+    if (f) {
+      f.left--
+      throw new Error(`store ${key} failed`)
+    }
+  }
   on('store.get', (_$, e) => ({ value: store.get(e.key) }) as never)
-  on('store.set', (_$, e) => (store.set(e.key, JSON.parse(JSON.stringify(e.value))), { value: undefined }) as never)
+  on('store.set', async (_$, e) => {
+    await held(e.key)
+    mayFail(e.key)
+    writes.push(`set ${e.key}`)
+    store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined } as never
+  })
+  on('store.delete', async (_$, e) => {
+    await held(e.key)
+    writes.push(`delete ${e.key}`)
+    store.delete(e.key)
+    return { value: undefined } as never
+  })
+  // the plugin's atoms as last written, for tests to read (this `$` has no `state`)
+  const atoms = new Map<string, unknown>()
+  on('state.set', (_$, e, next) => (atoms.set(`${(e as never as { plugin: string }).plugin}.${(e as never as { key: string }).key}`, (e as never as { value: unknown }).value), next(e)) as never)
+  on('store.keys', () => ({ value: [...store.keys()] }) as never)
+  idSupported = true
+  try {
+    on('session.id', async () => {
+      const answer = sid
+      if (idHold) {
+        const h = idHold
+        idHold = null // the next call alone
+        h.arrived()
+        await h.gate
+      }
+      if (answer === 'rejects') throw new Error('no session id')
+      return { value: answer === 'missing' ? undefined : answer } as never
+    })
+  } catch {
+    idSupported = false // an older Claude Code has no such op: nothing is published there
+  }
   const forks: number[] = []
   const logs: string[] = []
   const toasts: string[] = []
@@ -102,6 +156,34 @@ const setup = async ($: Engine, on: On, world: World = {}) => {
     clock, forks, prompts, logs, toasts, tails, store, specs, reads, switchTo: (m: string) => (model = m), moveTo: (r: string) => (root = r),
     rewind: (n: number) => (chat = chat.slice(0, -n)), talk: (text: string) => (chat = [...chat, said('user', text), said('assistant', 'ok')]),
     add: (role: 'user' | 'assistant', text: string) => (chat = [...chat, said(role, text)]),
+    atom: (ref: { plugin: string; key: string }) => atoms.get(`${ref.plugin}.${ref.key}`),
+    /** Holds the answer to the next `$.session.id()`, as it was when asked, at a gate. */
+    holdId: () => {
+      let release!: () => void
+      let arrived!: () => void
+      const gate = new Promise<void>(r => (release = r))
+      const waiting = new Promise<void>(r => (arrived = r))
+      idHold = { gate, arrived }
+      return { waiting, release }
+    },
+    writes, setId: (id: string) => (sid = id),
+    live: (id: string) => store.get(`live.${id}`) as Record<string, unknown> | undefined,
+    liveKeys: () => [...store.keys()].filter(k => k.startsWith('live.')),
+    failNext: (prefix: string, left = 1) => {
+      const f = { prefix, left }
+      failures.push(f)
+      return { clear: () => void (f.left = 0) }
+    },
+    /** Holds every store call on `prefix` at its gate: start the operation, `await waiting`, act, `release()`, then await it. */
+    holdStore: (prefix: string) => {
+      let release!: () => void
+      let arrived!: () => void
+      const gate = new Promise<void>(r => (release = r))
+      const waiting = new Promise<void>(r => (arrived = r))
+      const h = { prefix, gate, arrived }
+      holds.push(h)
+      return { waiting, release: () => (release(), holds.splice(holds.indexOf(h), 1)) }
+    },
   }
 }
 
@@ -1898,3 +1980,427 @@ test('state says what the last beat read and wrote', async ($: Engine, on: On) =
   expect((await stateNow($)).session).toMatchObject({ lastBeatReadTokens: 44_783, lastBeatWrittenTokens: 12 })
 })
 
+
+// ---- the state cachebeat publishes under its session id: store key `live.<id>` ----
+
+/** Whether this Claude Code takes a hook on `session.id`: set by the fixture, as the test's `$` cannot raise that op. */
+let idSupported = true
+
+/** Claude Code 2.1.287 has no `$.session.id`: nothing is published there, and these assertions don't apply. */
+const hasId = (_$: Engine) => idSupported
+const DAY = 24 * 60 * M
+const record = { v: 1, enabled: true, stopped: null, intervalMin: 5, stopAfterHours: 1, since: 1, updatedAt: 1 }
+
+type Run = (h: Awaited<ReturnType<typeof setup>>, $: Engine) => Promise<void>
+// the six ways beating stops by itself, each driven to its stop; `why` is part of the reason told
+const SELF_STOPS: { name: string; world: World; why: string; run: Run }[] = [
+  { name: 'the deadline', world: {}, why: 'h since your last message', run: async h => void (await h.clock.advance(DEADLINE + IDLE * 2)) },
+  {
+    name: 'an expired cache', why: 'so it has expired',
+    world: { fork: [{ isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: usage(0, 0) }] },
+    run: async h => void (await h.clock.advance(2 * IDLE)),
+  },
+  { name: 'a used up usage limit', world: { percentUsed: 100, settings: { stopAtUsage: 100 } }, why: 'usage limit reached', run: async h => void (await h.clock.advance(IDLE)) },
+  {
+    name: 'nothing to fork', why: 'nothing to keep warm',
+    world: { fork: [{ isAnswered: false, reason: 'nothing-to-fork', usage: usage(0, 0) }] },
+    run: async h => void (await h.clock.advance(IDLE)),
+  },
+  {
+    name: 'a rate limit', why: 'rate limited',
+    world: { fork: [{ isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage(0, 0) }] },
+    run: async h => void (await h.clock.advance(IDLE)),
+  },
+  {
+    name: 'two misses', why: 'the cache was not served', world: { fork: [{ ...ok, usage: usage(0, 90_000) }], settings: { interval: 50 } },
+    run: async h => void (await h.clock.advance(IDLE * 3)),
+  },
+]
+
+/** A session that stopped itself for its usage limit, its store untouched since. */
+const selfStopped = async ($: Engine, on: On, world: World = { percentUsed: 100, settings: { stopAtUsage: 100 } }) => {
+  const h = await setup($, on, world)
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  await h.clock.advance(IDLE)
+  await h.clock.settle()
+  return h
+}
+
+for (const defaultOn of [true, false]) {
+  test(`a new session publishes its state, on or off as new sessions start (${defaultOn ? 'on' : 'off'})`, async ($: Engine, on: On) => {
+    const { live, liveKeys } = await setup($, on, { settings: { defaultOn, interval: 7, stopAfterHours: 4 } })
+    if (!hasId($)) return
+    expect(liveKeys()).toEqual(['live.S1'])
+    expect(live('S1')).toEqual({
+      v: 1, enabled: defaultOn, stopped: null, intervalMin: 7, stopAfterHours: 4, since: expect.any(Number), updatedAt: expect.any(Number),
+    })
+  })
+}
+
+test('the interval published is the one in effect: auto reads 50, never the nullable override', async ($: Engine, on: On) => {
+  const { live, clock } = await setup($, on)
+  if (!hasId($)) return
+  expect(live('S1')?.intervalMin).toBe(50)
+  await cmd($, '9')
+  await clock.settle()
+  expect(live('S1')?.intervalMin).toBe(9)
+})
+
+test('a resumed new process overwrites the opposite state a record of its session id holds', async ($: Engine, on: On) => {
+  const { live } = await setup($, on, { seed: { 'live.S1': record }, settings: { defaultOn: false }, chat: [said('user', 'hi'), said('assistant', 'ok')] })
+  if (!hasId($)) return
+  expect(live('S1')).toMatchObject({ enabled: false, stopped: null, intervalMin: 50, stopAfterHours: 8 })
+  expect(live('S1')?.updatedAt).not.toBe(1)
+})
+
+for (const stop of SELF_STOPS) {
+  test(`stopping by itself for ${stop.name} publishes the reason and when; the saved state holds it while the store is held`, async ($: Engine, on: On) => {
+    const h = await setup($, on, stop.world)
+    await cmd($, 'on')
+    await $.turn.complete(turn)
+    const gate = h.holdStore('live.')
+    const running = stop.run(h, $)
+    if (!hasId($)) return void (await Promise.race([running, h.clock.settle()]))
+    await gate.waiting
+    const kept = h.atom(saved.ref) as { enabled: boolean; stopped: { at: number; why: string } | null }
+    expect(kept.enabled).toBe(false)
+    expect(kept.stopped).toEqual({ at: expect.any(Number), why: expect.stringContaining(stop.why) })
+    gate.release()
+    await running
+    await h.clock.settle()
+    expect(h.live('S1')).toMatchObject({ enabled: false, stopped: kept.stopped })
+  })
+}
+
+for (const [how, enable] of [['/cachebeat on', ($: Engine) => cmd($, 'on')], ['the set tool', ($: Engine) => call($, 'set', { session: { enabled: true } })]] as const) {
+  test(`${how} publishes "not stopped" before it replies`, async ($: Engine, on: On) => {
+    const world = { percentUsed: 100, settings: { stopAtUsage: 100 } }
+    const h = await selfStopped($, on, world)
+    if (!hasId($)) return
+    expect(h.live('S1')).toMatchObject({ enabled: false, stopped: { why: expect.any(String) } })
+    world.percentUsed = 10 // else the beat it starts stops again
+    await enable($)
+    expect(h.live('S1')).toMatchObject({ enabled: true, stopped: null }) // no settle: written before the reply
+  })
+}
+
+test('on again, on a session that is on, writes nothing', async ($: Engine, on: On) => {
+  const { writes } = await setup($, on)
+  await cmd($, 'on')
+  const before = writes.length
+  await cmd($, 'on')
+  await call($, 'set', { session: { enabled: true } })
+  expect(writes.length).toBe(before)
+})
+
+test('the set tool turning off a session that stopped itself keeps the reason; on a session that is on, none', async ($: Engine, on: On) => {
+  const h = await selfStopped($, on)
+  if (!hasId($)) return
+  const why = (h.live('S1')?.stopped as { why: string }).why
+  await call($, 'set', { session: { enabled: false } })
+  expect(h.live('S1')).toMatchObject({ enabled: false, stopped: { why } })
+  for (const off of [($: Engine) => call($, 'set', { session: { enabled: false } }), ($: Engine) => cmd($, 'off')]) {
+    await cmd($, 'on')
+    await off($)
+    await h.clock.settle()
+    expect(h.live('S1')).toMatchObject({ enabled: false, stopped: null })
+  }
+})
+
+for (const reason of ['clear', 'resume'] as const) {
+  test(`/${reason} while stopped: the id left is deleted, the new one holds the stopped state with a new since`, async ($: Engine, on: On) => {
+    const h = await selfStopped($, on)
+    if (!hasId($)) return
+    const was = h.live('S1')!
+    await h.clock.advance(3 * M)
+    // the old id still answers in session.end, and at the new session's start for a /resume
+    await $.session.end({ reason, sessionId: 'S1', resume: { id: 'S1' } })
+    await $.classic.SessionStart({ source: reason, session_id: 'S2' } as never)
+    await h.clock.settle()
+    h.setId('S2')
+    expect(h.live('S1')).toBeUndefined()
+    expect(h.live('S2')).toMatchObject({ enabled: false, stopped: was.stopped })
+    expect(h.live('S2')?.since).toBeGreaterThan(was.since as number)
+    await $.turn.start({ text: 'again', turnId: 't9' })
+    await h.clock.settle()
+    expect(h.liveKeys()).toEqual(['live.S2']) // S1 is not written back
+  })
+}
+
+test('A to B to A by /resume: the id left is deleted each time and the one returned to is published', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await cmd($, 'on')
+  for (const [from, to] of [['S1', 'S2'], ['S2', 'S1']] as const) {
+    await $.session.end({ reason: 'resume', sessionId: from, resume: { id: from } })
+    await $.classic.SessionStart({ source: 'resume', session_id: to } as never)
+    await h.clock.settle()
+    h.setId(to)
+    expect(h.liveKeys()).toEqual([`live.${to}`])
+    expect(h.live(to)).toMatchObject({ enabled: true })
+  }
+  await $.turn.start({ text: 'back', turnId: 't2' })
+  await h.clock.settle()
+  expect(h.liveKeys()).toEqual(['live.S1'])
+})
+
+test('with no classic event, a turn start under another id publishes it and never writes the old one again', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await h.clock.settle()
+  const from = h.writes.length
+  h.setId('S2')
+  await $.turn.start({ text: 'b', turnId: 't2' })
+  await h.clock.settle()
+  expect(h.live('S2')).toMatchObject({ enabled: false })
+  expect(h.writes.slice(from).filter(w => w.endsWith('live.S1'))).toEqual([])
+})
+
+test('a failed write is repaired at the next turn', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  const failing = h.failNext('live.', Infinity)
+  await cmd($, 'on') // the writes fail: the reply still comes
+  expect(h.live('S1')).toMatchObject({ enabled: false })
+  failing.clear()
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await h.clock.settle()
+  expect(h.live('S1')).toMatchObject({ enabled: true })
+})
+
+test('a record gone stale after a clean write is restored at the next main turn, not a subagent\'s', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await h.clock.settle()
+  h.store.set('live.S1', record) // an old activation's late write
+  await $.turn.start({ text: 'sub', turnId: 'a1', agentId: 'sub' } as never)
+  await h.clock.settle()
+  expect(h.live('S1')).toEqual(record)
+  await $.turn.start({ text: 'main', turnId: 't1' })
+  await h.clock.settle()
+  expect(h.live('S1')).toMatchObject({ enabled: false, intervalMin: 50, stopAfterHours: 8 })
+  expect(h.live('S1')?.updatedAt).not.toBe(1)
+})
+
+test('settings another session changed move the published interval, with no save', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  h.store.set('settings', { ...DEFAULTS, interval: 20, stopAfterHours: 24 })
+  await stateNow($) // reads the store's settings, as a turn's end would
+  await h.clock.settle()
+  expect(h.live('S1')).toMatchObject({ intervalMin: 20, stopAfterHours: 24 })
+})
+
+test('a set held before a /clear: the id left ends absent', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  const gate = h.holdStore('live.')
+  const turning = cmd($, 'on') // its write waits at the gate
+  await gate.waiting
+  const ending = $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+  gate.release()
+  await Promise.all([turning, ending])
+  await h.clock.settle()
+  expect(h.live('S1')).toBeUndefined()
+  h.setId('S2') // at the next main turn the engine answers the new id
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await h.clock.settle()
+  expect(h.live('S1')).toBeUndefined()
+  expect(h.live('S2')).toBeDefined()
+})
+
+test('a set held before an exit: the record ends absent and nothing is published after', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  const gate = h.holdStore('live.')
+  const turning = cmd($, 'on')
+  await gate.waiting
+  const ending = $.session.end({ reason: 'prompt_input_exit', sessionId: 'S1' } as never)
+  gate.release()
+  await Promise.all([turning, ending])
+  await h.clock.settle()
+  expect(h.live('S1')).toBeUndefined()
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await h.clock.settle()
+  expect(h.liveKeys()).toEqual([])
+})
+
+test('a delete queued by a /clear, then the same turn\'s verify under the new id: the old goes, the new stays', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await cmd($, 'on')
+  const gate = h.holdStore('live.')
+  const turning = cmd($, 'off') // held
+  await gate.waiting
+  const ending = $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+  h.setId('S2')
+  const starting = $.turn.start({ text: 'a', turnId: 't2' })
+  gate.release()
+  await Promise.all([turning, ending, starting])
+  await h.clock.settle()
+  expect(h.liveKeys()).toEqual(['live.S2'])
+})
+
+test('a self-stop held at the store, then /cachebeat on: the record ends on', async ($: Engine, on: On) => {
+  const world = { percentUsed: 100, settings: { stopAtUsage: 100 } }
+  const h = await setup($, on, world)
+  if (!hasId($)) return
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  const gate = h.holdStore('live.')
+  const stopping = h.clock.advance(IDLE)
+  await gate.waiting
+  world.percentUsed = 10 // else the beat the command starts stops again
+  const turning = cmd($, 'on')
+  gate.release()
+  await Promise.all([stopping, turning])
+  await h.clock.settle()
+  expect(h.live('S1')).toMatchObject({ enabled: true, stopped: null })
+})
+
+for (const sessionId of ['missing', 'rejects']) {
+  test(`with the session id ${sessionId}: nothing is published, and stopping and enabling work`, async ($: Engine, on: On) => {
+    const h = await setup($, on, { sessionId, percentUsed: 100, settings: { stopAtUsage: 100 } })
+    expect(await cmd($, 'on')).toContain('this session: on, every')
+    await $.turn.complete(turn)
+    await h.clock.advance(IDLE)
+    await h.clock.settle()
+    expect(h.logs.at(-1)).toBe('stopped: five-hour usage limit reached')
+    expect(await cmd($, 'on')).toContain('this session: on, every')
+    await $.turn.start({ text: 'a', turnId: 't1' })
+    await h.clock.settle()
+    expect(h.liveKeys()).toEqual([])
+  })
+}
+
+test('a rejected write of the legacy stops key is no unhandled rejection', async ($: Engine, on: On) => {
+  const h = await setup($, on, { percentUsed: 100, settings: { stopAtUsage: 100 } })
+  await cmd($, 'on')
+  await $.turn.complete(turn)
+  h.failNext('stops')
+  await h.clock.advance(IDLE)
+  await h.clock.settle()
+  expect(h.logs.at(-1)).toBe('stopped: five-hour usage limit reached')
+  expect(h.store.get('stops')).toBeUndefined()
+})
+
+test('a new process prunes records older than 30 days and keeps recent ones', async ($: Engine, on: On) => {
+  const h = await setup($, on, { seed: { 'live.OLD': { ...record, updatedAt: -31 * DAY }, 'live.NEW': { ...record, updatedAt: -DAY }, 'live.ODD': { v: 1 } } })
+  if (!hasId($)) return
+  await h.clock.settle()
+  expect(h.liveKeys().sort()).toEqual(['live.NEW', 'live.ODD', 'live.S1'])
+})
+
+for (const sessionId of ['missing', 'rejects']) {
+  test(`with the session id ${sessionId}: a /clear or /resume start naming an id publishes nothing`, async ($: Engine, on: On) => {
+    const h = await setup($, on, { sessionId })
+    for (const source of ['clear', 'resume'] as const) {
+      await $.session.end({ reason: source, sessionId: 'S1', resume: { id: 'S1' } })
+      await $.classic.SessionStart({ source, session_id: 'S2' } as never)
+      await h.clock.settle()
+    }
+    expect(h.liveKeys()).toEqual([])
+  })
+}
+
+for (const reason of ['clear', 'resume'] as const) {
+  test(`A to A by /${reason}: the id is published again after the start event, and after a turn start alone`, async ($: Engine, on: On) => {
+    const h = await setup($, on)
+    if (!hasId($)) return
+    await $.session.end({ reason, sessionId: 'S1', resume: { id: 'S1' } })
+    await $.classic.SessionStart({ source: reason, session_id: 'S1' } as never)
+    await h.clock.settle()
+    expect(h.live('S1')).toMatchObject({ enabled: false })
+    // with no start event, the turn's own read ends the id's being left
+    h.store.delete('live.S1')
+    await $.session.end({ reason, sessionId: 'S1', resume: { id: 'S1' } })
+    await h.clock.settle()
+    expect(h.live('S1')).toBeUndefined()
+    await $.turn.start({ text: 'a', turnId: 't1' })
+    await h.clock.settle()
+    expect(h.live('S1')).toMatchObject({ enabled: false })
+  })
+}
+
+test('an exit waits for the store at most a second, and leaves the end budget its margin', () => {
+  expect([Infinity, 1500, 1250, 600, 250, 100, 0].map(exitWait)).toEqual([1000, 1000, 1000, 350, 0, 0, 0])
+})
+
+test('an event publication held across a later A to B transition cannot reopen the id left', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } })
+  await h.clock.settle()
+  const from = h.writes.length
+  const gate = h.holdStore('live.')
+  const attaching = $.classic.SessionStart({ source: 'resume', session_id: 'S1' } as never) // A attached: its write is held
+  await gate.waiting
+  await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } }) // A to B; the engine still says A, and its end queues an ordinary publication
+  const arriving = $.classic.SessionStart({ source: 'resume', session_id: 'S2' } as never)
+  gate.release()
+  await Promise.all([attaching, arriving])
+  await h.clock.settle()
+  expect(h.writes.slice(from)).toEqual(['set live.S1', 'delete live.S1', 'set live.S2'])
+  expect(h.live('S1')).toBeUndefined()
+  expect(h.live('S2')).toBeDefined()
+})
+
+test('A to B to A with an event publication for A held throughout: B, left again, is never written back', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } })
+  await h.clock.settle()
+  const from = h.writes.length
+  const gate = h.holdStore('live.')
+  const attaching = $.classic.SessionStart({ source: 'resume', session_id: 'S1' } as never) // A's write is held
+  await gate.waiting
+  await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } }) // A to B
+  await $.classic.SessionStart({ source: 'resume', session_id: 'S2' } as never)
+  h.setId('S2')
+  await $.turn.start({ text: 'in B', turnId: 't2' })
+  await $.session.end({ reason: 'resume', sessionId: 'S2', resume: { id: 'S2' } }) // B to A
+  await $.classic.SessionStart({ source: 'resume', session_id: 'S1' } as never)
+  gate.release()
+  await attaching
+  await h.clock.settle()
+  const ops = h.writes.slice(from)
+  expect(ops.filter(w => w.endsWith('S2')).at(-1)).not.toBe('set live.S2') // whatever B had, its last word is the delete
+  expect(ops.at(-1)).toBe('set live.S1')
+  expect(h.liveKeys()).toEqual(['live.S1'])
+})
+
+test('A to B to A with an ordinary publication held across both departures: only A ends published', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  const gate = h.holdStore('live.')
+  const turning = cmd($, 'on') // its write for A is held
+  await gate.waiting
+  await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } })
+  await $.classic.SessionStart({ source: 'resume', session_id: 'S2' } as never)
+  h.setId('S2')
+  await $.session.end({ reason: 'resume', sessionId: 'S2', resume: { id: 'S2' } })
+  await $.classic.SessionStart({ source: 'resume', session_id: 'S1' } as never)
+  gate.release()
+  await turning
+  await h.clock.settle()
+  expect(h.liveKeys()).toEqual(['live.S1'])
+})
+
+test('an id read held across the next main turn, naming the id left, does not write it back', async ($: Engine, on: On) => {
+  const h = await setup($, on)
+  if (!hasId($)) return
+  await h.clock.settle()
+  const from = h.writes.length
+  const idGate = h.holdId()
+  await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } }) // A left; the end's publication reads the id
+  await idGate.waiting // the engine's answer, naming A, is on its way
+  await $.classic.SessionStart({ source: 'resume', session_id: 'S2' } as never)
+  h.setId('S2')
+  await $.turn.start({ text: 'in B', turnId: 't2' }) // the engine now answers B
+  idGate.release()
+  await h.clock.settle()
+  expect(h.writes.slice(from)).toEqual(['delete live.S1', 'set live.S2'])
+  expect(h.liveKeys()).toEqual(['live.S2'])
+})

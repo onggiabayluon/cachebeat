@@ -254,7 +254,22 @@ cachebeat turns itself off for the session when:
 
 It tells you why, the way you chose under **Alerts**. On auto, a cache that's gone before a 50-minute beat lasts five minutes: instead of stopping, cachebeat says so and beats every 4 minutes from there.
 
-A stop is also written to the plugin store (`~/.claude/plugins/store/cachebeat_*.json`, key `stops`) as `{ "<folder>": { "at": <epoch ms>, "why": "..." } }`, so a status display outside Claude Code can tell. Turning beating on again removes the entry. The key is the session's folder, since a plugin can't see its session id, so two sessions in one folder share it.
+A stop is also written to the plugin store (`~/.claude/plugins/store/cachebeat_*.json`, key `stops`) as `{ "<folder>": { "at": <epoch ms>, "why": "..." } }`, so a status display outside Claude Code can tell. Turning beating on again removes the entry. The key is the session's folder, so two sessions in one folder share it: that is why the per-session record below exists.
+
+### The state cachebeat publishes
+
+Each session also publishes its own state to the plugin store under the key `live.<sessionId>`, for a status display outside Claude Code to read:
+
+```json
+{ "v": 1, "enabled": true, "stopped": null, "intervalMin": 50, "stopAfterHours": 8, "since": 1700000000000, "updatedAt": 1700000000000 }
+```
+
+- `v` is the record's version, always `1` for now. A reader should ignore a record whose `v` it doesn't know.
+- `enabled` is whether this session is beating, and `stopped` is `{ "at": <epoch ms>, "why": "..." }` when cachebeat turned itself off (the reasons above), else `null`. Only turning beating on again clears `stopped`; turning it off by hand leaves it as it was.
+- `intervalMin` is the interval in effect, in minutes (on auto, what auto came to), and `stopAfterHours` is the **Stop after idle** setting.
+- `since` is when this process took on the conversation: a new start, a `/clear` or a `/resume`. `updatedAt` is when the record was last written, and a write that changes nothing is skipped.
+- It is the state cachebeat **last published**, not proof that it is alive: a session that crashes leaves its record behind until it is pruned (records older than 30 days are removed when a new session starts) or that session id starts again. A clean exit, a `/clear` and a `/resume` remove the record of the session they leave, on a best effort basis.
+- Nothing is published on a Claude Code that gives a plugin no session id (2.1.287 has none), and `stops` stays as it is for displays that predate this record.
 
 ## Good to know
 

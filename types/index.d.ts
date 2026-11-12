@@ -12,6 +12,8 @@ export type Saved = {
   beats: number // in this session
   row: string | null // the latest turn's closing row, which carries the status line
   small: string | null // why the context is not kept warm, while it is under the minimum
+  stopped: { at: number; why: string } | null // set by beating stopping itself, and why; only turning beating on clears it
+  since: number | null // when this process took on this conversation: a new start, /clear or /resume
   isCacheShort: boolean // a beat found this session's cache lasts five minutes, whatever its settings say
   paused: string | null // why beats wait for the next turn though the cache was warm: a model switch, a compaction
   warmModel: string | null // the model the last request ran on, whose cache a beat keeps warm

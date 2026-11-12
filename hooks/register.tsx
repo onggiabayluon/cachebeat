@@ -15,7 +15,7 @@ export const RETRY = MIN // after a transient API error
 export const MAX_TTL = 60 * MIN // past this since the last cache read, the cache is gone whatever the TTL
 
 const pulse = atom({ plugin: 'cachebeat', key: 'pulse' } as const, 'hidden' as Pulse)
-const saved = atom({ plugin: 'cachebeat', key: 'saved' } as const, null as Saved | null)
+export const saved = atom({ plugin: 'cachebeat', key: 'saved' } as const, null as Saved | null)
 const frameAtom = atom({ plugin: 'cachebeat', key: 'frame' } as const, 0)
 const lineFrameAtom = atom({ plugin: 'cachebeat', key: 'lineFrame' } as const, 0)
 const lineAtom = atom({ plugin: 'cachebeat', key: 'line' } as const, '')
@@ -27,7 +27,7 @@ const focusAtom = atom({ plugin: 'cachebeat', key: 'focus' } as const, '')
 
 const fresh: Saved = {
   enabled: false, idle: null, lastReal: null, lastWarm: null, lastRead: null, lastWrote: null, nextAt: null, beats: 0, row: null, small: null,
-  isCacheShort: false, paused: null, warmModel: null, tail: null, asked: null, turns: 0, missStreak: 0,
+  isCacheShort: false, paused: null, warmModel: null, tail: null, asked: null, turns: 0, missStreak: 0, stopped: null, since: null,
 }
 let s: Saved = { ...fresh }
 let cfg: BeatSettings = DEFAULTS // as they apply here: this folder's own over those for all folders
@@ -92,6 +92,117 @@ async function cacheTtl($: EngineInterface): Promise<Ttl> {
 function save($: EngineInterface) {
   const copy = { ...s }
   void update($, saved, () => copy)
+  void syncLive($)
+}
+
+// ---- the state published under this session's id, `live.<id>` in the store, for whoever watches from outside ----
+
+const LIVE = 'live.'
+const LIVE_KEEP = 30 * 24 * 60 * MIN // a record this old, left by a session that never exited, is pruned at a new start
+const LIVE_EXIT_WAIT = 1000 // ms an exit waits for the queue, within the end hook's own budget
+const LIVE_EXIT_MARGIN = 250 // ms of that budget left for the rest of the end
+
+/** How long an exit waits for the queue: at most a second, and never the budget's last margin. */
+export const exitWait = (remainingMs: number) => Math.min(LIVE_EXIT_WAIT, Math.max(0, remainingMs - LIVE_EXIT_MARGIN))
+
+type Live = { enabled: boolean; stopped: Saved['stopped']; intervalMin: number; stopAfterHours: number; since: number }
+
+const liveKey = (id: string) => LIVE + id
+const liveSame = (a: Live, b: Live) =>
+  JSON.stringify([a.enabled, a.stopped && [a.stopped.at, a.stopped.why], a.intervalMin, a.stopAfterHours, a.since])
+  === JSON.stringify([b.enabled, b.stopped && [b.stopped.at, b.stopped.why], b.intervalMin, b.stopAfterHours, b.since])
+
+/** The record as the store holds it, or null when it is missing or not one of ours. */
+function liveFrom(value: unknown): Live | null {
+  if (!isObject(value) || value.v !== 1) return null
+  const stopped = value.stopped
+  const isStopped = isObject(stopped) && typeof stopped.at === 'number' && typeof stopped.why === 'string'
+  if (typeof value.enabled !== 'boolean' || (stopped !== null && !isStopped)) return null
+  if (typeof value.intervalMin !== 'number' || typeof value.stopAfterHours !== 'number' || typeof value.since !== 'number') return null
+  return value as unknown as Live
+}
+
+// one queue per activation: writes and deletes run in the order they were asked, so a delete queued
+// after a write in flight lands after it. Each task catches its own failure
+let queue: Promise<void> = Promise.resolve()
+let lastLive: { id: string; snap: Live } | null = null // what this activation last wrote, and under which id
+const leftAt = new Map<string, number>() // each id a /clear or /resume left, by the departure's number: nothing ordinary is published for it again
+let closed = false // the session is exiting: nothing is published any more
+let pendingSync = false // a /clear or /resume is done: the next publication reads the store back
+let leaveEpoch = 0 // counts the departures: a publication asked before an id's own departure never lands after it
+let dirty = false // the last write or delete failed: the next publication reads the store back
+
+function enqueue(task: () => Promise<void>) {
+  const run = queue.then(async () => {
+    try {
+      await task()
+    } catch {
+      dirty = true
+    }
+  })
+  queue = run
+  return run
+}
+
+/** The session's id, or null where Claude Code has none to give (an older one) or it fails. */
+async function sessionId($: EngineInterface): Promise<string | null> {
+  try {
+    return (await $.session.id()) || null // an older Claude Code has no such op: the call throws
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Publishes this session's state under its id, the one writer of `live.<id>`. `verify` reads the store
+ * back and writes only if the record differs; `id` is the id the caller knows, over `$.session.id()`.
+ */
+function syncLive($: EngineInterface, opts: { verify?: boolean; id?: string } = {}) {
+  const epoch = leaveEpoch
+  return enqueue(async () => {
+    if (closed) return
+    // the engine must give an id at all: where it can't, nothing is published, even for an id an event names
+    const read = await sessionId($)
+    const id = opts.id ?? read
+    if (!read || !id) return
+    const left = leftAt.get(id)
+    // an id left: a publication asked before it left is stale, and an ordinary one may only be the engine still reporting it
+    if (left !== undefined && (epoch < left || !opts.id)) return
+    const snap: Live = {
+      enabled: s.enabled, stopped: s.stopped, intervalMin: idle() / MIN, stopAfterHours: cfg.stopAfterHours, since: s.since ?? 0,
+    }
+    const verify = opts.verify || dirty || pendingSync
+    const stored = verify ? liveFrom(await $.store.get(liveKey(id))) : null
+    const isCurrent = verify ? stored !== null && liveSame(stored, snap) : lastLive?.id === id && liveSame(lastLive.snap, snap)
+    if (!isCurrent) await $.store.set(liveKey(id), { v: 1, ...snap, updatedAt: await $.clock.now() })
+    lastLive = { id, snap }
+    // an event naming the id as active again ends its being left; no publication touches another id's entry
+    if (left !== undefined && leftAt.get(id) === left) leftAt.delete(id)
+    if (!leftAt.has(id)) {
+      pendingSync = false
+      dirty = false
+    }
+  })
+}
+
+/** Takes a session's record out of the store, after whatever write is in flight. */
+function dropLive($: EngineInterface, id: string) {
+  return enqueue(async () => {
+    if (lastLive?.id === id) lastLive = null
+    await $.store.delete(liveKey(id))
+  })
+}
+
+/** Deletes the records a session that never exited left, once a new process starts. */
+function pruneLive($: EngineInterface) {
+  return enqueue(async () => {
+    const now = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(LIVE)) continue
+      const at = (await $.store.get(key) as { updatedAt?: unknown } | undefined)?.updatedAt
+      if (typeof at === 'number' && now - at > LIVE_KEEP) await $.store.delete(key)
+    }
+  })
 }
 
 /**
@@ -183,6 +294,11 @@ const setSettings = ($: EngineInterface, patch: Partial<BeatSettings>, to: Targe
  * if its interval changed.
  */
 async function syncSettings($: EngineInterface) {
+  await syncedSettings($)
+  void syncLive($) // its interval or its stop-after may have moved with them
+}
+
+async function syncedSettings($: EngineInterface) {
   const before = JSON.stringify([global, root, own])
   const was = idle()
   await load($)
@@ -437,21 +553,31 @@ async function resumeIfWarmed($: EngineInterface) {
  * Tells whoever watches from outside (a status pill, a script) that beating stopped on its own, and why: the
  * plugin store's `stops`, by folder. Turning beating on again, here or by the session's own choice, takes it out.
  */
-async function noteStop($: EngineInterface, why: string | null) {
+async function noteStop($: EngineInterface, why: string | null, at?: number) {
   const stored = await $.store.get('stops')
   const stops = isObject(stored) ? { ...stored } : {}
   if (why === null) {
     if (!(root in stops)) return
     delete stops[root]
-  } else stops[root] = { at: await $.clock.now(), why }
+  } else stops[root] = { at: at ?? (await $.clock.now()), why }
   await $.store.set('stops', stops)
 }
 
-function stop($: EngineInterface, why?: string) {
+/** Beating turned off by hand: a session that is on has no stop to keep, and one that stopped itself keeps its reason. */
+function stop($: EngineInterface) {
   s.enabled = false
   void schedule($)
-  if (!why) return 'off'
-  void noteStop($, why)
+  return 'off'
+}
+
+/** Beating stops by itself, for `why`: told in the state published, outside by folder, and to the person. */
+async function selfStop($: EngineInterface, why: string) {
+  const at = await $.clock.now()
+  s.enabled = false
+  s.stopped = { at, why }
+  void schedule($) // saves before its first await, which publishes
+  void syncLive($)
+  noteStop($, why, at).catch(() => {})
   announce($, `stopped: ${why}`)
   return `stopped: ${why}`
 }
@@ -472,13 +598,13 @@ async function beat($: EngineInterface): Promise<string> {
   const warmedAt = s.lastWarm
   // from the user's last message: a turn's start, or its end for one begun before cachebeat saw it
   const lastWord = Math.max(s.lastReal ?? now, s.asked ?? -Infinity)
-  if (now - lastWord >= cfg.stopAfterHours * 60 * MIN) return stop($, `${cfg.stopAfterHours}h since your last message`)
-  if (since >= MAX_TTL) return stop($, 'over an hour since the cache was last read, so it has expired')
+  if (now - lastWord >= cfg.stopAfterHours * 60 * MIN) return await selfStop($, `${cfg.stopAfterHours}h since your last message`)
+  if (since >= MAX_TTL) return await selfStop($, 'over an hour since the cache was last read, so it has expired')
   const { rateLimits } = await $.session.usage()
   const full = rateLimits.find(l => l.percentUsed >= cfg.stopAtUsage)
   if (full) {
     const kind = full.kind.replace('_', '-')
-    return stop($, cfg.stopAtUsage >= 100 ? `${kind} usage limit reached` : `${kind} usage at ${full.percentUsed}%, past ${cfg.stopAtUsage}%`)
+    return await selfStop($, cfg.stopAtUsage >= 100 ? `${kind} usage limit reached` : `${kind} usage at ${full.percentUsed}%, past ${cfg.stopAtUsage}%`)
   }
   if (await smallContext($)) {
     await schedule($) // says so, and waits for a turn to grow it
@@ -507,9 +633,9 @@ async function beat($: EngineInterface): Promise<string> {
   const forking = $.model.fork({ prompt: busy ? ASK_MID_TURN : ASK })
   const r = await forking.finally(() => (beating = false))
   if (!r.isAnswered && r.reason !== 'empty-reply') {
-    if (r.reason === 'nothing-to-fork') return stop($, 'nothing to keep warm')
+    if (r.reason === 'nothing-to-fork') return await selfStop($, 'nothing to keep warm')
     const isTransient = r.reason === 'aborted' || r.error === 'overloaded' || r.error === 'server_error' || r.status === null
-    if (!isTransient) return stop($, r.error === 'rate_limit' ? 'rate limited' : `API error (${r.error})`)
+    if (!isTransient) return await selfStop($, r.error === 'rate_limit' ? 'rate limited' : `API error (${r.error})`)
     // a request of a turn begun meanwhile warmed the cache, and set the next beat from it: no retry needed
     const isWarmedSince = s.lastWarm !== warmedAt
     if (s.enabled && !stepping && !isWarmedSince) {
@@ -548,7 +674,7 @@ async function beat($: EngineInterface): Promise<string> {
     s.missStreak++
     // one miss can be a proxy switching accounts, not a cache that can't be kept: this beat wrote the cache afresh,
     // so it counts as a warm one. Two in a row, and beating stops
-    if (s.missStreak >= MISSES) return stop($, why)
+    if (s.missStreak >= MISSES) return await selfStop($, why)
     s.lastWarm = await $.clock.now()
     // under auto, a cache gone before an hour's interval lives five minutes, whatever the signs said:
     // this beat wrote it afresh, so beat at that from here
@@ -607,7 +733,7 @@ async function markWarm($: EngineInterface) {
 
 /** After /clear or /resume: another conversation, its count from zero, this session's switch and interval kept. */
 async function anotherConversation($: EngineInterface) {
-  s = { ...fresh, enabled: s.enabled, idle: s.idle, isCacheShort: s.isCacheShort }
+  s = { ...fresh, enabled: s.enabled, idle: s.idle, isCacheShort: s.isCacheShort, stopped: s.stopped, since: await $.clock.now() }
   cached = 0 // nothing of it cached yet
   resent = false
   await syncSettings($)
@@ -622,11 +748,18 @@ const here = () => `this folder (${cut(root, PATH)})`
 
 /** Turns this session on after `change` (its own interval, a saved setting), saying how its interval moved. */
 async function turnOn($: EngineInterface, change?: () => Promise<void>) {
+  const said = await turnedOn($, change)
+  await syncLive($) // before the reply, on every way out
+  return said
+}
+
+async function turnedOn($: EngineInterface, change?: () => Promise<void>) {
   const wasOn = s.enabled
   const before = idle()
   if (change) await change()
   if (!wasOn) s.missStreak = 0
   s.enabled = true
+  s.stopped = null
   await noteStop($, null)
   if (stepping) {
     save($)
@@ -786,6 +919,13 @@ function say($: EngineInterface, text: string) {
   void update($, tickAtom, t => t + 1)
 }
 
+/** A /clear or /resume leaves `id`: nothing is published for it again, and its record goes. */
+function leaveLive($: EngineInterface, id: string) {
+  leftAt.set(id, ++leaveEpoch)
+  pendingSync = true
+  void dropLive($, id)
+}
+
 const USAGE = 'usage: /cachebeat [on|off|<minutes>|now|settings] · global [on|off|<minutes>] · local [on|off|<minutes>|reset]'
 
 export const register: Register = on => {
@@ -798,6 +938,15 @@ export const register: Register = on => {
     const prev = await read($, saved)
     // a reload keeps this session's choice; a new session starts as its folder's settings say
     s = prev ? { ...fresh, ...prev } : { ...fresh, enabled: cfg.defaultOn }
+    s.since ??= await $.clock.now() // this process took on this conversation now, unless a reload carried it over
+    // an activation of its own: nothing written yet, nothing ended
+    queue = Promise.resolve()
+    lastLive = null
+    leftAt.clear()
+    closed = false
+    leaveEpoch = 0
+    pendingSync = false
+    dirty = false
     const messages = prev ? [] : await $.session.messages()
     // a new process with a conversation already in it: --resume, --continue
     if (messages.length) await pause($, RESUMED, RESUMED)
@@ -810,12 +959,15 @@ export const register: Register = on => {
     })
     await $.tool.register(STATE)
     await $.tool.register(SET)
+    await syncLive($)
+    if (!prev) void pruneLive($)
     return next(e)
   })
 
   // a /clear goes on under a new session, with no session.start and its state empty: a new
   // conversation, so it starts its count afresh, keeping whether this session beats and how often
   on('session.end', { reason: 'clear' }, async ($, e, next) => {
+    leaveLive($, e.sessionId)
     const r = await next(e)
     await anotherConversation($)
     await schedule($)
@@ -825,6 +977,7 @@ export const register: Register = on => {
   // /resume within a session: another conversation takes this one's place, with no session.start. A line logged here
   // would land in the conversation left behind: the resumed one's start says it
   on('session.end', { reason: 'resume' }, async ($, e, next) => {
+    leaveLive($, e.sessionId)
     const r = await next(e)
     await anotherConversation($)
     s.paused = RESUMED
@@ -833,7 +986,24 @@ export const register: Register = on => {
     return r
   })
 
+  // the exit: the record goes, best effort, and nothing is published after it
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') return next(e)
+    closed = true
+    const dropping = dropLive($, e.sessionId)
+    const r = await next(e)
+    const ms = exitWait(next.budget.remainingMs) // the budget is shared by the whole end
+    if (ms > 0) {
+      let wait: { cancel: () => void } | undefined
+      await Promise.race([dropping, new Promise<void>(resolve => (wait = $.clock.after(ms, resolve)))])
+      wait?.cancel()
+    }
+    return r
+  })
+
   on('classic.SessionStart', async ($, e, next) => {
+    // the id this event carries is the one the session goes on under; `$.session.id()` still answers the old one here
+    if (e.source === 'clear' || e.source === 'resume') void syncLive($, { id: e.session_id || undefined })
     if (e.source === 'resume' && isResumeUnsaid) {
       isResumeUnsaid = false
       // the resumed conversation is drawn once this hook settles: a line logged before that is drawn over
@@ -890,9 +1060,13 @@ export const register: Register = on => {
     if (change.intervalMinutes !== undefined) s.idle = change.intervalMinutes === null ? null : change.intervalMinutes * MIN
     if (change.enabled && !s.enabled) s.missStreak = 0
     if (change.enabled !== undefined) s.enabled = change.enabled
-    if (change.enabled) await noteStop($, null)
+    if (change.enabled) {
+      s.stopped = null
+      await noteStop($, null)
+    }
     // always: setSettings reschedules only while on, and this is what cancels a beat when turned off
     await schedule($)
+    await syncLive($) // before the reply
     return { result: json(await answerSet($, before, change)) }
   })
 
@@ -951,6 +1125,16 @@ export const register: Register = on => {
     // a fork's own turn, on an engine that raises one, carries the beat's line: a user's message sent while a beat
     // is on its way is a turn all the same
     if (!(beating && (e.text === ASK || e.text === ASK_MID_TURN))) {
+      // the main conversation's turn: its id is read afresh, which repairs a record lost, stale or overwritten late
+      if (e.agentId === undefined) {
+        // the id read at a main turn's start is the session's own: no id left is to be feared any more. The
+        // barriers go in queue order, after every publication already asked has read its id and landed
+        const upto = leaveEpoch
+        void enqueue(async () => {
+          for (const [id, n] of leftAt) if (n <= upto) leftAt.delete(id)
+        })
+        void syncLive($, { verify: true })
+      }
       busy = true
       turnId = e.turnId
       stepping = true // its first request goes out next
